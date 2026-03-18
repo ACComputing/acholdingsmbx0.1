@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mario Fan Builder — All-in-One Edition
-Extended SMBX 1.3 Editor + pygame-native asset generator, no Pillow needed.
-All 33 bugs resolved. Run directly: python mario_fan_builder_all_in_one.py
+AC's SMBX Engine — All-in-One Edition
+Supports: SMBX 1.2 .lvl  |  SMBX 1.3 .lvl  |  LunaLua .38a ZIP  |  Moondust .lvlx
+Pygame-native asset generator — no Pillow needed.  All 33 bugs resolved.
 """
 
 import pygame
@@ -13,6 +13,11 @@ import math
 import struct
 import json
 import configparser
+import zipfile
+import tempfile
+import shutil
+import io
+import xml.etree.ElementTree as ET
 from collections import deque
 
 # ── CONFIGURATION ──────────────────────────────────────────────────────────────
@@ -1771,6 +1776,7 @@ class Level:
         self.time_limit         = 300
         self.stars              = 0
         self.level_id           = 0
+        self.luna_config        = {}   # LunaLua .38a auxiliary data
 
     def current_section(self):
         return self.sections[self.current_section_idx]
@@ -1909,6 +1915,476 @@ def write_lvl(filename, level):
                 f.write(struct.pack('<I', ev.trigger))
                 f.write(struct.pack('<I', len(ev.actions)))
                 for a in ev.actions: f.write(struct.pack('<III', *a))
+
+
+# ── LUNALUA .38A FILE I/O ──────────────────────────────────────────────────────
+
+def read_38a(filename):
+    """
+    Read a SMBX LunaLua .38a file (ZIP archive) and return a Level object.
+    Extracts to a temp dir, reads level.lvl via read_lvl(), then loads all
+    auxiliary LunaLua text files into level.luna_config.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="smbx38a_")
+    try:
+        with zipfile.ZipFile(filename, 'r') as zf:
+            zf.extractall(temp_dir)
+
+        # Find level.lvl — may be in root or a sub-folder
+        level_path = os.path.join(temp_dir, "level.lvl")
+        if not os.path.exists(level_path):
+            for root, dirs, files in os.walk(temp_dir):
+                if "level.lvl" in files:
+                    level_path = os.path.join(root, "level.lvl")
+                    break
+            else:
+                raise FileNotFoundError("No level.lvl found inside archive")
+
+        level = read_lvl(level_path)
+        level.luna_config = {}
+        base = os.path.dirname(level_path)
+
+        # Known named text files
+        for key, fname in [('layers',   'layers.txt'),
+                            ('events',   'events.txt'),
+                            ('lunadll',  'lunadll.txt'),
+                            ('warps',    'warp.txt'),
+                            ('sounds',   'sound.txt'),
+                            ('settings', 'settings.txt')]:
+            p = os.path.join(base, fname)
+            if os.path.exists(p):
+                with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                    level.luna_config[key] = f.read()
+
+        # Everything else (custom scripts, graphics, etc.) stored as raw bytes
+        known = {'level.lvl','layers.txt','events.txt','lunadll.txt',
+                 'warp.txt','sound.txt','settings.txt'}
+        other = {}
+        for root, dirs, files in os.walk(temp_dir):
+            for fn in files:
+                if fn in known:
+                    continue
+                full = os.path.join(root, fn)
+                arcname = os.path.relpath(full, temp_dir).replace("\\", "/")
+                with open(full, 'rb') as f:
+                    other[arcname] = f.read()
+        level.luna_config['other_files'] = other
+        return level
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def write_38a(filename, level):
+    """
+    Write a Level object to a SMBX LunaLua .38a ZIP archive.
+    Creates level.lvl from base data plus all luna_config aux files.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="smbx38a_")
+    try:
+        write_lvl(os.path.join(temp_dir, "level.lvl"), level)
+
+        cfg = getattr(level, 'luna_config', {})
+        for key, fname in [('layers',   'layers.txt'),
+                            ('events',   'events.txt'),
+                            ('lunadll',  'lunadll.txt'),
+                            ('warps',    'warp.txt'),
+                            ('sounds',   'sound.txt'),
+                            ('settings', 'settings.txt')]:
+            if key in cfg:
+                with open(os.path.join(temp_dir, fname), 'w', encoding='utf-8') as f:
+                    f.write(cfg[key])
+
+        for relpath, content in cfg.get('other_files', {}).items():
+            full = os.path.join(temp_dir, relpath)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, 'wb') as f:
+                f.write(content)
+
+        with zipfile.ZipFile(filename, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(temp_dir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    zf.write(full, os.path.relpath(full, temp_dir))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-FORMAT FILE I/O
+#   detect_format(filename)  → 'lvl12' | 'lvl13' | '38a' | 'lvlx' | 'unknown'
+#   smart_read(filename)     → Level
+#   smart_write(filename, level)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_format(filename):
+    """Return a string identifying the file format without fully parsing it."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in ('.38a',):
+        return '38a'
+    if ext in ('.lvlx',):
+        return 'lvlx'
+    if ext not in ('.lvl', ''):
+        return 'unknown'
+    # Peek at binary header to distinguish 1.2 vs 1.3
+    try:
+        with open(filename, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'LVL\x1a':
+                # Could be a ZIP (38a renamed to .lvl) or lvlx XML
+                f.seek(0)
+                head = f.read(2)
+                if head == b'PK':
+                    return '38a'
+                f.seek(0)
+                chunk = f.read(64).lstrip()
+                if chunk.startswith(b'<?xml') or chunk.startswith(b'<'):
+                    return 'lvlx'
+                return 'unknown'
+            version = struct.unpack('<I', f.read(4))[0]
+            return 'lvl12' if version <= 2 else 'lvl13'
+    except Exception:
+        return 'unknown'
+
+
+# ── SMBX 1.2 reader ───────────────────────────────────────────────────────────
+# 1.2 binary layout is identical to 1.3 EXCEPT:
+#   • Version field = 1 or 2
+#   • NPC record is 24 bytes (no direction/special_data fields)
+#   • Warp record is 48 bytes instead of 64
+# Everything else (header, tiles, BGOs, events) is the same.
+
+def read_lvl12(filename):
+    level = Level()
+    try:
+        with open(filename, 'rb') as f:
+            if f.read(4) != b'LVL\x1a':
+                return level
+            f.read(4)  # version (1 or 2)
+            level.name       = f.read(32).decode('utf-8','ignore').strip('\x00')
+            level.author     = f.read(32).decode('utf-8','ignore').strip('\x00')
+            level.time_limit = struct.unpack('<I', f.read(4))[0]
+            level.stars      = struct.unpack('<I', f.read(4))[0]
+            flags            = struct.unpack('<I', f.read(4))[0]
+            level.no_background = bool(flags & 1)
+            f.read(HDR_PAD)
+
+            num_sections = struct.unpack('<I', f.read(4))[0]
+            level.sections = []
+            for _ in range(num_sections):
+                sec       = Section()
+                sec.width  = struct.unpack('<I', f.read(4))[0]
+                sec.height = struct.unpack('<I', f.read(4))[0]
+                r, g, b   = struct.unpack('<BBB', f.read(3))
+                sec.bg_color = (r, g, b); f.read(1)
+                sec.music    = struct.unpack('<I', f.read(4))[0]
+
+                nb = struct.unpack('<I', f.read(4))[0]
+                for _ in range(nb):
+                    x, y, tid, li, eid, fl = struct.unpack('<IIIIII', f.read(24))
+                    if tid in TILE_ID_TO_NAME:
+                        while len(sec.layers) <= li:
+                            sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                        sec.layers[li].add_tile(
+                            Tile(x, y, TILE_ID_TO_NAME[tid], layer_idx=li, event_id=eid, flags=fl))
+
+                ng = struct.unpack('<I', f.read(4))[0]
+                for _ in range(ng):
+                    x, y, tid, li, fl = struct.unpack('<IIIII', f.read(20))
+                    if tid in BGO_ID_TO_NAME:
+                        while len(sec.layers) <= li:
+                            sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                        sec.layers[li].bgos.add(BGO(x, y, BGO_ID_TO_NAME[tid], layer_idx=li, flags=fl))
+
+                nn = struct.unpack('<I', f.read(4))[0]
+                for _ in range(nn):
+                    # 1.2: 24-byte NPC record — no direction or special_data
+                    x, y, tid, li, eid, fl = struct.unpack('<IIIIII', f.read(24))
+                    if tid in NPC_ID_TO_NAME:
+                        while len(sec.layers) <= li:
+                            sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                        sec.layers[li].npcs.add(
+                            NPC(x, y, NPC_ID_TO_NAME[tid], layer_idx=li, event_id=eid, flags=fl))
+
+                nw = struct.unpack('<I', f.read(4))[0]
+                for _ in range(nw):
+                    f.read(48)           # 1.2 warp = 48 bytes
+                    sec.warps.append(Warp())
+
+                nev = struct.unpack('<I', f.read(4))[0]
+                for _ in range(nev):
+                    nl   = struct.unpack('<B', f.read(1))[0]
+                    name = f.read(nl).decode('utf-8')
+                    trig = struct.unpack('<I', f.read(4))[0]
+                    na   = struct.unpack('<I', f.read(4))[0]
+                    acts = [struct.unpack('<III', f.read(12)) for _ in range(na)]
+                    sec.events.append(Event(name, trig, acts))
+
+                level.sections.append(sec)
+
+        for sec in level.sections:
+            for layer in sec.layers:
+                for npc in list(layer.npcs):
+                    if npc.npc_type == 'start':
+                        level.start_pos = (npc.rect.x, npc.rect.y)
+                        layer.npcs.remove(npc)
+    except Exception as e:
+        print("SMBX 1.2 load error:", e)
+    return level
+
+
+def write_lvl12(filename, level):
+    """Write a 1.2-compatible binary .lvl (version byte = 2, 24-byte NPCs, 48-byte warps)."""
+    with open(filename, 'wb') as f:
+        f.write(b'LVL\x1a')
+        f.write(struct.pack('<I', 2))                  # version = 2
+        f.write(level.name.encode()[:31].ljust(32, b'\x00'))
+        f.write(level.author.encode()[:31].ljust(32, b'\x00'))
+        f.write(struct.pack('<I', level.time_limit))
+        f.write(struct.pack('<I', level.stars))
+        f.write(struct.pack('<I', 1 if level.no_background else 0))
+        f.write(b'\x00' * HDR_PAD)
+
+        f.write(struct.pack('<I', len(level.sections)))
+        for sec in level.sections:
+            f.write(struct.pack('<I', sec.width))
+            f.write(struct.pack('<I', sec.height))
+            f.write(struct.pack('<BBB', *sec.bg_color[:3])); f.write(b'\x00')
+            f.write(struct.pack('<I', sec.music))
+
+            blocks = [(t.rect.x, t.rect.y, TILE_SMBX_IDS.get(t.tile_type, 1),
+                       t.layer_index, t.event_id, t.flags)
+                      for layer in sec.layers for t in layer.tiles]
+            f.write(struct.pack('<I', len(blocks)))
+            for b in blocks: f.write(struct.pack('<IIIIII', *b))
+
+            bgos = [(b.rect.x, b.rect.y, BGO_SMBX_IDS.get(b.bgo_type, 5),
+                     b.layer_index, b.flags)
+                    for layer in sec.layers for b in layer.bgos]
+            f.write(struct.pack('<I', len(bgos)))
+            for b in bgos: f.write(struct.pack('<IIIII', *b))
+
+            npcs = [(n.rect.x, n.rect.y, NPC_SMBX_IDS.get(n.npc_type, 1),
+                     n.layer_index, n.event_id, n.flags)
+                    for layer in sec.layers for n in layer.npcs]
+            f.write(struct.pack('<I', len(npcs)))
+            for n in npcs: f.write(struct.pack('<IIIIII', *n))  # 24 bytes, no dir/sp
+
+            f.write(struct.pack('<I', len(sec.warps)))
+            for _ in sec.warps: f.write(b'\x00' * 48)           # 48-byte warps
+
+            f.write(struct.pack('<I', len(sec.events)))
+            for ev in sec.events:
+                nb = ev.name.encode('utf-8')
+                f.write(struct.pack('<B', len(nb))); f.write(nb)
+                f.write(struct.pack('<I', ev.trigger))
+                f.write(struct.pack('<I', len(ev.actions)))
+                for a in ev.actions: f.write(struct.pack('<III', *a))
+
+
+# ── Moondust / PGE .lvlx reader / writer ─────────────────────────────────────
+# .lvlx is UTF-8 XML used by the PGE (Platformer Game Engine) / Moondust editor.
+# Spec reference: https://wohlsoft.ru/pgewiki/Level_file_format_(LVLX)
+# We implement a practical subset covering all object types we support.
+
+def _lvlx_int(el, attr, default=0):
+    try: return int(el.get(attr, default))
+    except: return default
+
+def _lvlx_bool(el, attr, default=False):
+    return el.get(attr, '0') not in ('0', 'false', 'False', '')
+
+
+def read_lvlx(filename):
+    """Read a Moondust/PGE .lvlx (XML) file into a Level object."""
+    level = Level()
+    try:
+        tree = ET.parse(filename)
+        root = tree.getroot()
+
+        # --- head ---
+        head = root.find('head')
+        if head is not None:
+            level.name       = head.findtext('title', 'Untitled')
+            level.author     = head.findtext('author', 'Unknown')
+            level.time_limit = _lvlx_int(head.find('timer') or ET.Element('x'), 'value', 300)
+            level.stars      = _lvlx_int(head.find('stars') or ET.Element('x'), 'value', 0)
+
+        # --- sections ---
+        level.sections = []
+        for sec_el in root.findall('section'):
+            sec = Section()
+            # size_x / size_y in LVLX are right/bottom edge coordinates
+            sec.width  = _lvlx_int(sec_el, 'size_right',  3200)
+            sec.height = _lvlx_int(sec_el, 'size_bottom', 960)
+            sec.music  = _lvlx_int(sec_el, 'music_id', 1)
+            bg_r = _lvlx_int(sec_el, 'bgcolor_r', 92)
+            bg_g = _lvlx_int(sec_el, 'bgcolor_g', 148)
+            bg_b = _lvlx_int(sec_el, 'bgcolor_b', 252)
+            sec.bg_color = (bg_r, bg_g, bg_b)
+
+            # blocks → Tiles
+            for bl in sec_el.findall('block'):
+                tid = _lvlx_int(bl, 'id')
+                x   = _lvlx_int(bl, 'x')
+                y   = _lvlx_int(bl, 'y')
+                li  = _lvlx_int(bl, 'layer', 0)
+                eid = _lvlx_int(bl, 'event_destroy', -1)
+                fl  = _lvlx_int(bl, 'invisible', 0)
+                # Snap to grid
+                x = (x // GRID_SIZE) * GRID_SIZE
+                y = (y // GRID_SIZE) * GRID_SIZE
+                if tid in TILE_ID_TO_NAME:
+                    while len(sec.layers) <= li:
+                        sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                    sec.layers[li].add_tile(
+                        Tile(x, y, TILE_ID_TO_NAME[tid], layer_idx=li, event_id=eid, flags=fl))
+
+            # bgo → BGOs
+            for bg in sec_el.findall('bgo'):
+                tid = _lvlx_int(bg, 'id')
+                x   = ((_lvlx_int(bg, 'x')) // GRID_SIZE) * GRID_SIZE
+                y   = ((_lvlx_int(bg, 'y')) // GRID_SIZE) * GRID_SIZE
+                li  = _lvlx_int(bg, 'layer', 0)
+                if tid in BGO_ID_TO_NAME:
+                    while len(sec.layers) <= li:
+                        sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                    sec.layers[li].bgos.add(BGO(x, y, BGO_ID_TO_NAME[tid], layer_idx=li))
+
+            # npc → NPCs
+            for npc_el in sec_el.findall('npc'):
+                tid = _lvlx_int(npc_el, 'id')
+                x   = ((_lvlx_int(npc_el, 'x')) // GRID_SIZE) * GRID_SIZE
+                y   = ((_lvlx_int(npc_el, 'y')) // GRID_SIZE) * GRID_SIZE
+                li  = _lvlx_int(npc_el, 'layer', 0)
+                dr  = _lvlx_int(npc_el, 'direction', 1)
+                sp  = _lvlx_int(npc_el, 'special_data', 0)
+                eid = _lvlx_int(npc_el, 'event_activate', -1)
+                if tid in NPC_ID_TO_NAME:
+                    while len(sec.layers) <= li:
+                        sec.layers.append(Layer(f"Layer {len(sec.layers)+1}"))
+                    sec.layers[li].npcs.add(
+                        NPC(x, y, NPC_ID_TO_NAME[tid], layer_idx=li, event_id=eid,
+                            direction=dr, special_data=sp))
+
+            # warps / doors
+            for door in sec_el.findall('door'):
+                sec.warps.append(Warp())
+
+            # events
+            for ev_el in sec_el.findall('event'):
+                name = ev_el.get('name', '')
+                trig = _lvlx_int(ev_el, 'trigger', 0)
+                sec.events.append(Event(name, trig, []))
+
+            level.sections.append(sec)
+
+        if not level.sections:
+            level.sections = [Section()]
+
+        # Resolve start position
+        for sec in level.sections:
+            sp_el = root.find('.//player_point')
+            if sp_el is not None:
+                level.start_pos = (_lvlx_int(sp_el, 'x', 100),
+                                   _lvlx_int(sp_el, 'y', 500))
+    except Exception as e:
+        print("LVLX load error:", e)
+    return level
+
+
+def write_lvlx(filename, level):
+    """Write a Level object as a Moondust/PGE .lvlx XML file."""
+    root = ET.Element('root')
+    root.set('type', 'LevelFile')
+    root.set('fileformat', 'LVLX')
+    root.set('format_version', '67')
+
+    head = ET.SubElement(root, 'head')
+    ET.SubElement(head, 'title').text  = level.name
+    ET.SubElement(head, 'author').text = level.author
+    timer = ET.SubElement(head, 'timer'); timer.set('value', str(level.time_limit))
+    stars = ET.SubElement(head, 'stars'); stars.set('value', str(level.stars))
+
+    sp = ET.SubElement(root, 'player_point')
+    sp.set('x', str(level.start_pos[0])); sp.set('y', str(level.start_pos[1]))
+
+    for si, sec in enumerate(level.sections):
+        sec_el = ET.SubElement(root, 'section')
+        sec_el.set('id', str(si))
+        sec_el.set('size_right',  str(sec.width))
+        sec_el.set('size_bottom', str(sec.height))
+        sec_el.set('music_id',    str(sec.music))
+        sec_el.set('bgcolor_r',   str(sec.bg_color[0]))
+        sec_el.set('bgcolor_g',   str(sec.bg_color[1]))
+        sec_el.set('bgcolor_b',   str(sec.bg_color[2]))
+
+        for li, layer in enumerate(sec.layers):
+            for tile in layer.tiles:
+                bl = ET.SubElement(sec_el, 'block')
+                bl.set('id',      str(TILE_SMBX_IDS.get(tile.tile_type, 1)))
+                bl.set('x',       str(tile.rect.x))
+                bl.set('y',       str(tile.rect.y))
+                bl.set('layer',   str(li))
+                bl.set('event_destroy', str(tile.event_id))
+                bl.set('invisible',     str(tile.flags))
+
+            for bgo in layer.bgos:
+                bg = ET.SubElement(sec_el, 'bgo')
+                bg.set('id',    str(BGO_SMBX_IDS.get(bgo.bgo_type, 5)))
+                bg.set('x',     str(bgo.rect.x))
+                bg.set('y',     str(bgo.rect.y))
+                bg.set('layer', str(li))
+
+            for npc in layer.npcs:
+                ne = ET.SubElement(sec_el, 'npc')
+                ne.set('id',           str(NPC_SMBX_IDS.get(npc.npc_type, 1)))
+                ne.set('x',            str(npc.rect.x))
+                ne.set('y',            str(npc.rect.y))
+                ne.set('layer',        str(li))
+                ne.set('direction',    str(npc.direction))
+                ne.set('special_data', str(npc.special_data))
+                ne.set('event_activate', str(npc.event_id))
+
+        for warp in sec.warps:
+            ET.SubElement(sec_el, 'door')
+
+        for ev in sec.events:
+            ev_el = ET.SubElement(sec_el, 'event')
+            ev_el.set('name', ev.name)
+            ev_el.set('trigger', str(ev.trigger))
+
+    tree = ET.ElementTree(root)
+    ET.indent(tree, space='  ')
+    tree.write(filename, encoding='utf-8', xml_declaration=True)
+
+
+# ── Smart dispatch ────────────────────────────────────────────────────────────
+
+def smart_read(filename):
+    """Auto-detect format and return a Level object."""
+    fmt = detect_format(filename)
+    if fmt == 'lvl12':  return read_lvl12(filename)
+    if fmt == 'lvl13':  return read_lvl(filename)
+    if fmt == '38a':    return read_38a(filename)
+    if fmt == 'lvlx':   return read_lvlx(filename)
+    # Last-ditch: try each reader in order
+    for reader in (read_lvl, read_lvl12, read_lvlx, read_38a):
+        try:
+            lvl = reader(filename)
+            if lvl.sections: return lvl
+        except Exception:
+            pass
+    return Level()
+
+
+def smart_write(filename, level):
+    """Write level using the format implied by the file extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == '.lvlx':   write_lvlx(filename, level)
+    elif ext == '.38a':  write_38a(filename, level)
+    elif ext == '.lvl2': write_lvl12(filename, level)
+    else:                write_lvl(filename, level)   # default: SMBX 1.3
+
 
 # ── MENU SYSTEM ────────────────────────────────────────────────────────────────
 class MenuItem:
@@ -2244,6 +2720,7 @@ class Editor:
             MI("Save",           self.cmd_save,       "Ctrl+S"),
             MI("Save As…",       self.cmd_save_as,    "Ctrl+Shift+S"),
             MI("",separator=True),
+            MI("Export as 38A",  self.cmd_export_38a),
             MI("Export as JSON", self.cmd_export_json),
             MI("",separator=True),
             MI("Exit",           self.cmd_exit,       "Alt+F4"),
@@ -2362,32 +2839,54 @@ class Editor:
             self.status("New level created.")
 
     def cmd_open(self):
-        fn = InputDialog(self.screen,"Open Level","Enter filename:","level.lvl").run()
+        fn = InputDialog(self.screen,"Open Level","Enter filename (.lvl / .38a):","level.lvl").run()
         if fn:
             if os.path.exists(fn):
-                self.level       = read_lvl(fn)
-                self.current_file= fn
-                sec = self.level.current_section()
-                self.camera      = Camera(sec.width, sec.height)
-                self.status(f"Opened: {fn}")
+                try:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in ('.38a', '.lvlx'):
+                        self.level = read_38a(fn)
+                    else:
+                        self.level = read_lvl(fn)
+                    self.current_file = fn
+                    sec = self.level.current_section()
+                    self.camera = Camera(sec.width, sec.height)
+                    self.undo_stack.clear(); self.redo_stack.clear(); self.selection.clear()
+                    self.status(f"Opened: {fn}")
+                except Exception as e:
+                    MessageBox(self.screen,"Error",f"Failed to open:\n{fn}\n\n{e}").run()
             else:
                 MessageBox(self.screen,"Error",f"File not found:\n{fn}").run()
 
     def cmd_save(self):
         if not self.current_file: self.cmd_save_as(); return
-        write_lvl(self.current_file, self.level)
-        self.status(f"Saved: {self.current_file}")
+        try:
+            ext = os.path.splitext(self.current_file)[1].lower()
+            if ext in ('.38a', '.lvlx'):
+                write_38a(self.current_file, self.level)
+            else:
+                write_lvl(self.current_file, self.level)
+            self.status(f"Saved: {self.current_file}")
+        except Exception as e:
+            MessageBox(self.screen,"Save Error",str(e)).run()
 
     def cmd_save_as(self):
-        fn = InputDialog(self.screen,"Save As","Enter filename:",
+        fn = InputDialog(self.screen,"Save As","Enter filename (.lvl / .38a):",
                          self.current_file or "level.lvl").run()
         if fn:
-            self.current_file = fn
-            write_lvl(fn, self.level)
-            self.status(f"Saved as: {fn}")
+            try:
+                self.current_file = fn
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in ('.38a', '.lvlx'):
+                    write_38a(fn, self.level)
+                else:
+                    write_lvl(fn, self.level)
+                self.status(f"Saved as: {fn}")
+            except Exception as e:
+                MessageBox(self.screen,"Save Error",str(e)).run()
 
     def cmd_export_json(self):
-        fn  = (self.current_file or "level").replace(".lvl","") + ".json"
+        fn  = (self.current_file or "level").replace(".lvl","").replace(".38a","") + ".json"
         sec = self.level.current_section()
         data= {"name":self.level.name,"author":self.level.author,
                "tiles":[],"bgos":[],"npcs":[]}
@@ -2399,10 +2898,22 @@ class Editor:
             for n in layer.npcs:
                 data["npcs"].append({"x":n.rect.x,"y":n.rect.y,"type":n.npc_type,"layer":li})
         with open(fn,'w') as f: json.dump(data,f,indent=2)
-        MessageBox(self.screen,"Export","Exported to:\n"+fn).run()
+        MessageBox(self.screen,"Export",f"Exported to:\n{fn}").run()
+
+    def cmd_export_38a(self):
+        default = (self.current_file or "level").replace(".lvl","") + ".38a"
+        fn = InputDialog(self.screen,"Export as 38A","Enter filename:",default).run()
+        if fn:
+            if not fn.lower().endswith(('.38a','.lvlx')):
+                fn += ".38a"
+            try:
+                write_38a(fn, self.level)
+                self.status(f"Exported as 38A: {fn}")
+            except Exception as e:
+                MessageBox(self.screen,"Export Error",str(e)).run()
 
     def cmd_exit(self):
-        r = MessageBox(self.screen,"Exit","Exit Mario Fan Builder?",("Yes","No")).run()
+        r = MessageBox(self.screen,"Exit","Exit AC's SMBX 1-tech?",("Yes","No")).run()
         if r == "Yes": pygame.quit(); sys.exit()
 
     def cmd_zoom_in(self):
@@ -2513,9 +3024,10 @@ class Editor:
 
     def cmd_about(self):
         MessageBox(self.screen,"About",
-            "Mario Fan Builder\n"
-            "CATSAN Engine  (C) AC Holding\n\n"
-            "Extended SMBX 1.3 Edition\n"
+            "AC's SMBX 1-tech\n"
+            "AC Holdings Engine  (C) 2026\n\n"
+            "Multi-Engine Edition\n"
+            "SMBX 1.3 / 1.2 / .38a (LunaLua) support\n"
             "Built with Python + Pygame").run()
 
     def cmd_event_editor(self):
@@ -2991,14 +3503,14 @@ def main_menu(screen):
         draw_edge(screen, wr, raised=True)
         tr = pygame.Rect(wr.x, wr.y, wr.w, 22)
         pygame.draw.rect(screen, SYS_HIGHLIGHT, tr)
-        draw_text(screen,"Mario Fan Builder — Extended SMBX 1.3 Edition",
+        draw_text(screen,"AC's SMBX 1-tech — Multi-Engine Edition",
                   (tr.x+4, tr.y+4), WHITE, FONT_SMALL)
         cr = pygame.Rect(wr.x+6, tr.bottom+6, wr.w-12, wr.h-tr.h-12)
         pygame.draw.rect(screen, SYS_WINDOW, cr)
         draw_edge(screen, cr, raised=False)
-        draw_text(screen,"Mario Fan Builder",(cr.centerx,cr.y+44),SYS_HIGHLIGHT,FONT_TITLE,True)
-        draw_text(screen,"SMBX 1.3 Style Level Editor",(cr.centerx,cr.y+72),SYS_TEXT,FONT,True)
-        draw_text(screen,"CATSAN Engine  (C) AC Holding",(cr.centerx,cr.y+94),GRAY,FONT_SMALL,True)
+        draw_text(screen,"AC's SMBX 1-tech",(cr.centerx,cr.y+44),SYS_HIGHLIGHT,FONT_TITLE,True)
+        draw_text(screen,"SMBX 1.3 / 1.2 / .38a Level Editor",(cr.centerx,cr.y+72),SYS_TEXT,FONT,True)
+        draw_text(screen,"AC Holdings Engine  (C) 2026",(cr.centerx,cr.y+94),GRAY,FONT_SMALL,True)
         for i,(r,lbl) in enumerate(zip(btns,labels)):
             sel = (i==hovered)
             pygame.draw.rect(screen, SYS_HIGHLIGHT if sel else SYS_BTN_FACE, r)
@@ -3011,7 +3523,7 @@ def main_menu(screen):
 def main():
     # FIX B01: initialise pygame first, then create fonts
     pygame.init()
-    pygame.display.set_caption("Mario Fan Builder — Extended SMBX 1.3 Edition")
+    pygame.display.set_caption("AC's SMBX 1-tech — Multi-Engine Edition")
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 
     # FIX B01: assign all global FONT objects NOW, after pygame.init()
@@ -3035,9 +3547,16 @@ def main():
             pygame.quit(); sys.exit()
         level = Level()
         if result == "LOAD":
-            fn = InputDialog(screen,"Open Level","Enter filename:","level.lvl").run()
+            fn = InputDialog(screen,"Open Level","Enter filename (.lvl / .38a):","level.lvl").run()
             if fn and os.path.exists(fn):
-                level = read_lvl(fn)
+                try:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in ('.38a', '.lvlx'):
+                        level = read_38a(fn)
+                    else:
+                        level = read_lvl(fn)
+                except Exception as e:
+                    MessageBox(screen,"Open Error",str(e)).run()
         editor  = Editor(level, screen)
         running = True
         while running:
